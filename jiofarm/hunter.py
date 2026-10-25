@@ -117,6 +117,7 @@ def hunt_once(
     state.logged_in = False
     state.link = None
     state.error = ""
+    s: requests.Session | None = None
 
     try:
         # 1) rent a number --------------------------------------------------
@@ -190,14 +191,18 @@ def hunt_once(
         raise
     except Exception as e:
         state.phase = Phase.ERROR
-        state.error = str(e)
-        if state.act_id:
+        state.error = cfg.redact(str(e))
+        if state.act_id and not state.logged_in:
             refunds.schedule(state.act_id, cfg.cancel_delay)
         return None
     finally:
-        store.save(state.phone, state.act_id, state.otp, state.logged_in, state.link)
-        state.attempts += 1
-        slots.release()
+        try:
+            if s is not None:
+                s.close()
+            store.save(state.phone, state.act_id, state.otp, state.logged_in, state.link)
+        finally:
+            state.attempts += 1
+            slots.release()
 
 
 # ------------------------------------------------------------------- provider factory
@@ -208,10 +213,10 @@ def create_provider(cfg: Config) -> SMSProvider:
     if cfg.provider == "grizzlysms":
         from jiofarm.grizzly.client import GrizzlySMS
 
-        return GrizzlySMS(cfg.api_key)  # type: ignore[return-value]
+        return GrizzlySMS(cfg.api_key, product=cfg.product)  # type: ignore[return-value]
     elif cfg.provider == "fivesim":
         from jiofarm.fivesim.client import FiveSim
 
-        return FiveSim(cfg.api_key)  # type: ignore[return-value]
+        return FiveSim(cfg.api_key, product=cfg.product)  # type: ignore[return-value]
     else:
         raise SystemExit(f"Provider tidak dikenal: {cfg.provider}")

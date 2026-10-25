@@ -30,6 +30,7 @@ app = typer.Typer(
     name="jiofarm",
     help="Jio Google AI Pro Hunter — panen link redeem Gemini Pro",
     no_args_is_help=False,
+    pretty_exceptions_show_locals=False,
 )
 
 # ------------------------------------------------------------------- helpers
@@ -40,7 +41,9 @@ def _parse_duration(s: str) -> float:
     m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", s.strip())
     if m and any(m.groups()):
         h, mi, se = (int(g) if g else 0 for g in m.groups())
-        return h * 3600 + mi * 60 + se
+        seconds = h * 3600 + mi * 60 + se
+        if seconds > 0:
+            return seconds
     raise typer.BadParameter(f"durasi tidak valid: '{s}' (contoh: 2h, 30m, 1h30m)")
 
 
@@ -85,6 +88,7 @@ def _build_layout(
     refunds: RefundWorker,
     cfg: Config,
     links: list[str],
+    initial_balance: float | None = None,
 ) -> Layout:
     """Build the Rich Layout for the live dashboard."""
     layout = Layout()
@@ -98,14 +102,12 @@ def _build_layout(
     header_text = Text()
     header_text.append("🦁 JioFarm Hunter", style="bold yellow")
     header_text.append(f"  |  workers: {cfg.effective_concurrency}", style="dim")
-    header_text.append(f"  |  max-price: ${cfg.effective_max_price}", style="dim")
+    header_text.append(f"  |  max-price: {cfg.effective_max_price} (account currency)", style="dim")
     header_text.append(f"  |  refund pending: {refunds.pending}", style="dim")
     header_text.append(f"\n⏱  {int(elapsed)}s elapsed", style="cyan")
-    try:
-        bal = provider.balance()
-        header_text.append(f"  |  💰 ${bal:,.2f}", style="bold green")
-    except Exception:
-        header_text.append("  |  💰 ???", style="red")
+    # Rendering must not issue blocking/rate-limited provider requests.
+    if initial_balance is not None:
+        header_text.append(f"  |  initial balance: {initial_balance:,.4f} (account currency)", style="bold green")
     header_text.append(f"  |  🎯 {found} links", style="bold green")
     layout["header"].update(Panel(header_text, box=box.ROUNDED, border_style="cyan"))
 
@@ -192,76 +194,91 @@ def balance(
     label = cfg.provider.upper()
     try:
         bal = provider.balance()
-        console.print(f"💰 Saldo {label}: [success]${bal:,.2f}[/]")
+        console.print(f"💰 Saldo {label}: [success]{bal:,.4f} (account currency)[/]")
     except Exception as e:
-        console.print(f"[error]Gagal cek saldo: {e}[/]")
+        console.print("Balance check failed: " + cfg.redact(str(e)), markup=False)
+        raise typer.Exit(code=1) from None
 
 
 @app.command()
 def run(
-    count: Optional[int] = typer.Option(None, "--count", help="Jumlah nomor yang dibeli (mode tetap)"),
-    target: Optional[int] = typer.Option(None, "--target", help="Berhenti setelah N link ketemu"),
+    count: Optional[int] = typer.Option(None, "--count", min=1, help="Hard cap on purchase attempts, including duration/target modes"),
+    target: Optional[int] = typer.Option(None, "--target", min=1, help="Berhenti setelah N link ketemu"),
     duration: Optional[str] = typer.Option(None, "--duration", help="Jalan selama (2h/30m/1h30m)"),
-    concurrency: Optional[int] = typer.Option(None, "-c", "--concurrency", help="Jumlah sewa paralel aktif"),
-    max_price: Optional[float] = typer.Option(None, "--max-price", help="Harga maksimum per nomor USD"),
-    db: str = typer.Option("results.db", "--db", help="Path database SQLite"),
+    concurrency: Optional[int] = typer.Option(None, "-c", "--concurrency", min=1, help="Jumlah sewa paralel aktif"),
+    max_price: Optional[float] = typer.Option(None, "--max-price", min=0, help="Maximum price per number in provider account currency"),
+    db: Optional[str] = typer.Option(None, "--db", help="SQLite path; defaults to DB_PATH"),
 ) -> None:
     """Jalankan perburuan link Google AI Pro."""
     cfg = load_config()
     cfg.max_price_override = max_price
     cfg.concurrency_override = concurrency
-    cfg.db_path = db
+    if db is not None:
+        cfg.db_path = db
+    if (target is not None or duration is not None) and count is None:
+        raise typer.BadParameter("--target and --duration require an explicit --count purchase cap")
+    cfg.count = 1 if count is None else count
 
     if target is not None:
         cfg.target = target
     if duration is not None:
         cfg.duration = _parse_duration(duration)
 
+    try:
+        cfg.validate()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+
     install_doh_shield()
     provider = create_provider(cfg)
     store = Store(cfg.db_path)
-    refunds = RefundWorker(provider, log=lambda msg: console.log(f"[dim]♻ {msg}[/]"))
 
     # initial balance
     try:
         bal = provider.balance()
-        console.print(f"💰 Saldo ({cfg.provider}): [success]${bal:,.2f}[/]")
-    except Exception:
-        console.print("[warning]Tidak bisa cek saldo[/]")
+        console.print(f"💰 Saldo ({cfg.provider}): [success]{bal:,.4f} (account currency)[/]")
+    except Exception as exc:
+        store.conn.close()
+        console.print("Cannot verify provider balance: " + cfg.redact(str(exc)), markup=False)
+        raise typer.Exit(code=1) from None
 
+    refunds = RefundWorker(provider, log=lambda msg: console.log(cfg.redact(msg), markup=False))
     workers_count = cfg.effective_concurrency
     workers = [WorkerState(wid=i + 1) for i in range(workers_count)]
     slots = threading.Semaphore(workers_count)
     found: list[str] = []
     done_count = [0]
     stop = threading.Event()
-    start = time.time()
+    start = time.monotonic()
     lock = threading.Lock()
-    is_count_mode = not (cfg.duration or cfg.target)
+    failed = [False]
 
     def hit_stop() -> bool:
         if stop.is_set():
             return True
-        if cfg.duration and time.time() - start >= cfg.duration:
+        if cfg.duration and time.monotonic() - start >= cfg.duration:
             return True
         if cfg.target and len(found) >= cfg.target:
             return True
-        if is_count_mode and done_count[0] >= (count or 1):
+        if done_count[0] >= cfg.count:
             return True
         return False
 
-    def job(ws: WorkerState, mode_count: bool) -> None:
+    def job(ws: WorkerState) -> None:
         while not hit_stop():
             with lock:
-                if mode_count and done_count[0] >= (count or 1):
+                if hit_stop():
                     return
                 done_count[0] += 1
             try:
                 link = hunt_once(provider, store, refunds, slots, cfg, ws)
             except Exception as e:
                 ws.phase = Phase.ERROR
-                ws.error = str(e)
+                ws.error = cfg.redact(str(e))
                 link = None
+            if ws.phase == Phase.ERROR:
+                failed[0] = True
+                stop.set()  # No further purchases after an unresolved failure.
             if link:
                 with lock:
                     found.append(link)
@@ -269,47 +286,53 @@ def run(
                 time.sleep(3)
 
     # start worker threads
-    if cfg.duration or cfg.target:
-        threads = [
-            threading.Thread(target=job, args=(workers[i], False), daemon=True)
-            for i in range(workers_count)
-        ]
-    else:
-        threads = [
-            threading.Thread(target=job, args=(workers[i], True), daemon=True)
-            for i in range(min(workers_count, count or 1))
-        ]
-    for t in threads:
-        t.start()
-
-    # live dashboard loop
+    threads = [
+        threading.Thread(target=job, args=(workers[i],), daemon=False)
+        for i in range(min(workers_count, cfg.count))
+    ]
+    # Cleanup also covers a failed thread start or dashboard renderer.
     try:
+        for t in threads:
+            t.start()
         with Live(
-            _build_layout(provider, workers, len(found), 0, refunds, cfg, found),
+            _build_layout(provider, workers, len(found), 0, refunds, cfg, found, bal),
             console=console,
             refresh_per_second=2,
             screen=True,
         ) as live:
-            while not hit_stop():
+            while any(t.is_alive() for t in threads):
+                if hit_stop():
+                    stop.set()
                 time.sleep(0.5)
-                elapsed = time.time() - start
+                elapsed = time.monotonic() - start
                 live.update(
-                    _build_layout(provider, workers, len(found), elapsed, refunds, cfg, found)
+                    _build_layout(provider, workers, len(found), elapsed, refunds, cfg, found, bal)
                 )
-                # count mode: exit when all threads are done
-                if is_count_mode and all(not t.is_alive() for t in threads):
-                    break
+                # Stop new work, but never abandon an active order.
             stop.set()
     except KeyboardInterrupt:
         console.print("\n[warning]Dihentikan oleh user.[/]")
         stop.set()
 
-    # wait for threads
-    for t in threads:
-        t.join(timeout=30)
+    except Exception as exc:
+        failed[0] = True
+        console.print(f"Execution/display failure ({type(exc).__name__}); draining active orders.", markup=False)
+    finally:
+        stop.set()
+        # A purchased activation can outlive 30 seconds. Drain every worker
+        # before waiting for refunds, so late refund jobs cannot be lost.
+        for t in threads:
+            if t.ident is not None:
+                t.join()
+        try:
+            refunded = refunds.wait_all(timeout=900)
+        finally:
+            store.conn.close()
 
-    elapsed = time.time() - start
-    refunds.wait_all()
+    elapsed = time.monotonic() - start
+    if not refunded:
+        console.print("Refunds remain unconfirmed; reconcile activation IDs in the database before running again.", markup=False)
+        raise typer.Exit(code=1)
 
     # final summary
     console.print()
@@ -324,9 +347,14 @@ def run(
     console.print(summary)
 
     if found:
-        console.print("\n[bold green]🎯 Links:[/]")
+        console.print("Links found:")
         for l in found:
-            console.print(f"  [link]{l}[/]")
+            console.print(l, markup=False)
+    if failed[0]:
+        for worker in workers:
+            if worker.error:
+                console.print(cfg.redact(worker.error), markup=False)
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -402,7 +430,7 @@ def main_callback(
     if choice == "1":
         # interactive run setup
         console.print()
-        mp = Prompt.ask("  Max price per nomor (USD)", default="1.0")
+        mp = Prompt.ask("  Maximum price (provider account currency)", default="0.3")
         mode = Prompt.ask(
             "  Mode",
             choices=["single", "duration", "target"],
@@ -419,7 +447,10 @@ def main_callback(
         else:
             args.extend(["--count", "1"])
 
-        c = Prompt.ask("  Concurrency", default="2")
+        if mode != "single":
+            cap = Prompt.ask("  Maximum purchase attempts", default="1")
+            args.extend(["--count", cap])
+        c = Prompt.ask("  Concurrency", default="1")
         args.extend(["-c", c])
 
         # relaunch the run command
