@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,7 +51,7 @@ def load_config() -> "Config":
     else:
         raise SystemExit(f"PROVIDER tidak dikenal: '{provider}'. Pilih: grizzlysms, fivesim")
 
-    return Config(
+    config = Config(
         provider=provider,
         api_key=api_key,
         product=product,
@@ -62,6 +63,8 @@ def load_config() -> "Config":
         tg_bot_token=os.getenv("TG_BOT_TOKEN", "").strip(),
         tg_chat_id=os.getenv("TG_CHAT_ID", "").strip(),
     )
+    config.validate()
+    return config
 
 
 @dataclass
@@ -69,7 +72,7 @@ class Config:
     """All runtime configuration, sourced from .env and overridden by CLI args."""
 
     provider: str = "grizzlysms"
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     product: str = "jio"  # GrizzlySMS: "jio", 5SIM: "jiomart"
     max_price: float = 1.0
     cancel_delay: float = 150.0
@@ -78,8 +81,8 @@ class Config:
     db_path: str = "results.db"
 
     # telegram (optional)
-    tg_bot_token: str = ""
-    tg_chat_id: str = ""
+    tg_bot_token: str = field(default="", repr=False)
+    tg_chat_id: str = field(default="", repr=False)
 
     # runtime overrides (set by CLI)
     max_price_override: float | None = field(default=None, repr=False)
@@ -96,7 +99,29 @@ class Config:
 
     @property
     def effective_concurrency(self) -> int:
-        return self.concurrency_override or self.concurrency
+        return self.concurrency if self.concurrency_override is None else self.concurrency_override
+
+    def validate(self) -> None:
+        """Validate before any provider request or worker is started."""
+        for name, value in (("concurrency", self.effective_concurrency), ("count", self.count)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name, value in (("max_price", self.effective_max_price),
+                            ("cancel_delay", self.cancel_delay),
+                            ("otp_fail_delay", self.otp_fail_delay)):
+            if value is None or not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.target is not None and (not isinstance(self.target, int) or self.target < 1):
+            raise ValueError("target must be a positive integer")
+        if self.duration is not None and (not math.isfinite(self.duration) or self.duration <= 0):
+            raise ValueError("duration must be positive and finite")
+
+    def redact(self, message: str) -> str:
+        """Remove configured credentials from diagnostic text."""
+        for secret in (self.api_key, self.tg_bot_token):
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+        return message
 
     @property
     def telegram_enabled(self) -> bool:

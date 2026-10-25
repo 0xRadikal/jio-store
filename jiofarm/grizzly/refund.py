@@ -34,7 +34,9 @@ class RefundWorker:
         self.q: "queue.Queue[tuple[str, float, bool]]" = queue.Queue()
         self.pending = 0
         self._lock = threading.Lock()
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def schedule(self, act_id: str, delay: float, aggressive: bool = False) -> None:
         """Schedule a refund.
@@ -46,14 +48,13 @@ class RefundWorker:
         """
         with self._lock:
             self.pending += 1
-        self.q.put((act_id, time.time() + delay, aggressive))
+        self.q.put((act_id, time.monotonic() + delay, aggressive))
         mode = "aggressive" if aggressive else "normal"
         self.log(f"refund #{act_id[-8:]} dijadwalkan ({mode}, {int(delay)}s)")
 
     def _loop(self) -> None:
-        while True:
-            time.sleep(2)
-            due_now = time.time()
+        while not self._stop.wait(2):
+            due_now = time.monotonic()
             batch: list[tuple[str, float, bool]] = []
             while True:
                 try:
@@ -70,21 +71,29 @@ class RefundWorker:
                         with self._lock:
                             self.pending -= 1
                     except Exception as e:
-                        err = str(e)
+                        err = type(e).__name__
                         # retry: aggressive = every 30s, normal = every 10s
                         retry_delay = AGGRESSIVE_INTERVAL if aggressive else 10
                         self.log(f"refund #{act_id[-8:]} gagal: {err} — retry {int(retry_delay)}s")
-                        remaining.append((act_id, time.time() + retry_delay, aggressive))
+                        remaining.append((act_id, time.monotonic() + retry_delay, aggressive))
                 else:
                     remaining.append((act_id, fire_at, aggressive))
 
             for item in remaining:
                 self.q.put(item)
 
-    def wait_all(self) -> None:
-        """Block until all pending refunds are processed."""
+    def wait_all(self, timeout: float | None = None) -> bool:
+        """Wait for confirmed cancellations; False never means refunded.
+
+        A bounded caller must report unresolved activations for reconciliation.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             with self._lock:
                 if self.pending <= 0:
-                    return
+                    self._stop.set()
+                    self._thread.join()
+                    return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
             time.sleep(1)
